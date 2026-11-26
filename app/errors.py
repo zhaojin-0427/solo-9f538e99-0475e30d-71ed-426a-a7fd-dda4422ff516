@@ -55,3 +55,21 @@ class StaleSignoffError(AppError):
 class EdgeRemovedError(AppError):
     status_code = 409
     code = "edge_removed"
+
+
+class InvalidRoundingRequestError(AppError):
+    """厘米测绘稿取整单的请求本身无法解析 / 引用了未知宗地。"""
+
+    status_code = 422
+    code = "invalid_rounding_request"
+
+
+class NoFeasibleRoundingError(AppError):
+    """在当前宗地图上，没有任何“下/上取整米”组合满足全部约束。
+
+    与写入冲突一样按 409 处理：同一稿件换一个现状库可能有解。
+    抛出前 service 层已经回滚事务，原宗地图与供数不变。
+    """
+
+    status_code = 409
+    code = "no_feasible_rounding"

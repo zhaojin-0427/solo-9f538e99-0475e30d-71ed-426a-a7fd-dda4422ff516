@@ -1,5 +1,128 @@
 # 交付说明（DELIVERY）
 
+---
+
+# 第二轮：厘米测绘稿 → 整米最优取整单（2026-11-26）
+
+本轮在第一轮“共边核验 / 签收 / 制图供数”平台上，按新要求增加了**厘米坐标下/上
+取整、保共边、绕开库中宗地、最优 + 字典序平局、分组不指数枚举、整单原子入库**
+能力。第一轮全部功能与 29 个用例保持不变，新增 26 个用例，**合计 55 passed**。
+
+## A. 要求 → 实现对照
+
+| 要求 | 实现位置 | 说明 / 验证 |
+| --- | --- | --- |
+| `/docs` 提交宗地号 + 整数厘米轴对齐矩形 + 须保留共边的宗地对 | `POST /api/rounding/orders`；`app/schemas.py::RoundingOrderIn` | `/docs` 可见并可直接 Try it out；兼容 `rect_cm/rect/bbox`、4 角点 `ring`、宗地号→矩形映射、并行 `parcel_nos+rectangles`、对象/数组式宗地对；另挂 `/api/orders/round-cm`、`/api/rounding` 等别名，并让老 `POST /api/orders` 识别 `"unit":"cm"` 取整报文 |
+| 每条边只能向下或向上取整米 | `app/rounding.py::edge_choices` | `floor(c/100)` 与 `ceil(c/100)`；负坐标按数学 floor/ceil（如 -105cm→-2m/-1m）；恰为整米只有一个选择 |
+| 取整后正面积 | `rectangle_candidates` | 严格 `L<R 且 B<T`，否则该候选丢弃；退化厘米稿也可能“向外取整”出正面积，故不提前 422 |
+| 指定宗地对仍有正长度共边 | `rects_shared_edge_length` + 分量内约束；库内任意形状用 `geometry.shared_segments` | 严格正长度，单点接触不算（有专项无解用例 + 正长度对照）；支持“本单↔本单”“本单↔库内宗地”“两宗库内地”三种对 |
+| 本单之间、与库中未改单宗地不得正面积叠压 | 候选级 `has_interior_overlap` + 分量枚举 `rects_positive_overlap` + 落库前整单冲突校验 | 边界共边合法；库内回读沿用 bbox 候选规划，只回读可能相交的外环 |
+| 各边位移绝对值之和最小 | `Candidate.cost_cm`，分量内选 `(cost, lex)` 最小 | 位移用厘米整数 `|cm-100m|`；用米表示只相差 100 倍常数，不影响选解；响应同时给 `total_cost_cm` 与 `total_displacement_m` |
+| 平局：宗地号排序，逐宗左、下、右、上字典序最小 | `solve_rounding` 的 `lex_tuple` / 全局 `lex_key` | 有“四余 50 全向下”和“A/Z 交错编号”专项用例 |
+| 候选范围互不相交、组间无共边要求时组合数不随组数指数增长 | 耦合图连通分量 + 逐分量 `itertools.product` | `combinations_checked=Σ_分量∏候选数`；60 独立组实查 240 组、500 组 54ms；响应给 `groups/combinations_checked/naive_joint_combinations` 可核对 |
+| 按入库时现行宗地图求解 | `service.submit_rounding_order` | 在同一 `BEGIN IMMEDIATE` 写事务内读现行库 → 求解 → 落库，写锁串行化并发整单 |
+| 沿用整单改界规则 | `service.persist_validated_order`（从 `apply_order` 抽出的事务体内核） | 取整结果构造为整米 `OrderIn`，复用冲突整单退回、upsert、共边版本对账/签收失效、orders 记录 |
+| 成功返回整米坐标 | 响应 `rectangles[].rect/ring/bbox` 等 | 全部 `int`；GET 宗地复核库内即整米环 |
+| 无解照旧 | `409 no_feasible_rounding` + 回滚 | 不写 parcels/orders；有用例核对坏单 404、原环不变、已签收 feed 仍在 |
+| 写入失败照旧 | 同一事务 `except: ROLLBACK` | monkeypatch 共边阶段写故障，验证两宗旧环与 orders 计数不变 |
+| 沿用旧 SQLite 卷 | **未改 `app/db.py` / 表结构 / `docker-compose.yml` 卷** | 仍是 `cadastre-data:/data` → `/data/cadastre.db`；旧卷直接被新代码打开 |
+| docker compose 启动 | `Dockerfile` `COPY app ./app` 自动含 `rounding.py/solver.py` | compose YAML 解析通过；沙箱无 docker，未实跑构建（见 D 节） |
+
+额外提供 `POST /api/rounding/solve`（及 `/api/rounding/plan`、`/api/round-rectangles`
+别名）做不落库 dry-run，始终 200 并带 `feasible`，便于先看最优解与组合统计。
+
+## B. 算法与“不指数”的正确性说明
+
+1. 每宗矩形 4 条边各 ≤2 个取值 → ≤16 个候选，先过正面积/坐标范围，再过
+   “与每个库内障碍无正面积叠压”“与固定库内共边对保持共边”两个一元过滤。
+2. 建无向耦合图：两宗本单宗地之间，若有共边保留要求，或**存在**一对候选会正面积
+   叠压，则连边（先用候选并集包络做 O(1) 排除）。
+3. 连通分量之间：没有共边要求，且任意候选对都不会叠压，因此约束完全解耦；总代价
+   为各分量代价之和。逐分量穷举 `(总位移, 分量字典序键)` 最小者，再合并。
+4. 全局字典序可由“各分量取各自字典序最小”直接合并得到：全局最早出现的差异坐标
+   必属于某个分量，而该分量已在其代价最优解集内取了字典序最小（有随机差分测试背书）。
+5. `tests/test_rounding.py` 中 3 个随机种子 ×30 例，把分解求解器与**不做分解的全
+   笛卡尔积暴力枚举**逐例比对最优矩形、代价、字典序键与可行性，全部一致。
+
+## C. 本轮实测（均为本环境真实执行）
+
+依赖仍装在 `/tmp/pylibs`（fastapi 0.165.0 / pydantic 2.14.4 / pytest 9.2.0 / httpx）。
+
+```bash
+PYTHONPATH=/tmp/pylibs python3 -m pytest -q
+# 55 passed, 1 warning in ~8s     （第一轮 29 + 本轮 26）
+
+PYTHONPATH=/tmp/pylibs python3 scripts/trial.py
+# 全部试跑断言通过（第一轮 25 条叙述断言无回归）
+
+PYTHONPATH=/tmp/pylibs python3 scripts/trial_rounding.py
+# 21 条断言全部通过，覆盖：
+#  保共边 forced x=11（96cm）、绕开 O 取 [509,0,510,10]、
+#  余数 50 字典序全向下、60 独立组实查 240（线性）、
+#  无解 409 且宗地/单/供数照旧
+```
+
+真实 uvicorn + curl（与 Docker 同一启动模块，端口 8137，临时库 `/tmp/live_round.db`）：
+
+```
+GET  /health                                   -> {"status":"ok","database":"ok"}
+GET  /openapi.json                             -> 含 /api/rounding/orders,/api/rounding/solve
+POST /api/orders SEED O=[510,0]-[520,10]       -> applied
+POST /api/rounding/orders A/B 保共边            -> A=[0,0,11,10] B=[11,0,20,10] cost96 checked4
+POST /api/rounding/orders P 绕开 O              -> P=[509,0,510,10]
+GET  /api/shared-edges A/B                     -> 1 条 [[11,0],[11,10]]
+POST /api/rounding/orders 无解 Z=[0,0,10,10]    -> HTTP 409 no_feasible_rounding
+GET  /api/parcels/Z ; /api/orders/BAD          -> 404 ; 404
+GET  /docs                                     -> 200
+```
+
+## D. docker / compose 实测边界（如实说明）
+
+- 本沙箱**没有 `docker` / `podman` / `nerdctl` 可执行文件**（`/.dockerenv` 表明
+  自身也在容器内），因此 `docker compose build/up` 本轮仍**未能真实执行**。
+- 已核对：`docker-compose.yml` 通过 PyYAML 解析，服务/端口 `8000:8000`/命名卷
+  `cadastre-data:/data`/`CADASTRE_DB_PATH=/data/cadastre.db`/healthcheck 不变；
+  `Dockerfile` 为 `python:3.12-slim` + `pip install -r requirements.txt` +
+  `COPY app ./app`，新增 `app/rounding.py`、`app/solver.py` 会自动入镜像，
+  启动命令仍是上面已用等价方式实测通过的 `uvicorn app.main:app --host 0.0.0.0 --port 8000`。
+- 目标机有 Docker 时：`docker compose up --build`，开 <http://localhost:8000/docs>。
+
+## E. 本轮新增 / 改动文件
+
+```
+app/rounding.py        # 纯求解器：取整候选、几何谓词、耦合分组、最优+字典序
+app/solver.py          # 命名别名（app.solver.solve / solve_rounding ...）
+app/schemas.py         # RoundingOrderIn + 宽松报文归一；OrderIn 增量识别取整单
+app/errors.py          # InvalidRoundingRequestError(422) / NoFeasibleRoundingError(409)
+app/service.py         # 抽出 persist_validated_order；新增 submit/plan_rounding_order
+app/main.py            # /api/rounding/* 路由与路径别名；/api/orders 分流
+tests/test_rounding.py # 26 个用例（算法/随机差分/API/事务回滚/固定库共边）
+scripts/trial_rounding.py
+README.md / DELIVERY.md
+```
+
+## F. 仍未完成 / 已知限制（第二轮视角）
+
+1. **未实跑 Docker 构建**：原因同 D，沙箱无容器运行时；只做到 YAML 解析 + 等价
+   uvicorn/curl 实测。
+2. **组内仍是穷举**：只保证“组数”不指数；单个强耦合组若含极多宗地，`∏候选数`
+   仍可能很大。任务只要求互不相交组不指数，且候选每宗 ≤16；如未来出现数百宗
+   强耦合矩形链，需要再上 CSP/动态规划。当前对链/簇状常见场景足够（随机差分
+   覆盖到 4 宗全枚举）。
+3. **厘米矩形模型**：本轮入口按题意只做**轴对齐矩形**；第一轮的任意正交外环能力
+   仍保留在 `/api/orders`，但厘米求解器不直接处理 L 形等厘米多边形（可先取其
+   bbox 或扩展候选生成）。
+4. **无解状态码取舍**：依赖现状库的无解按基线“冲突”惯例返回 `409`；纯报文形态
+   错误（非整数、越界厘米范围、引用未知宗地等）返回 `422/404`。另提供 dry-run
+   200 + `feasible:false` 以便不依赖状态码的集成。
+5. 第一轮 DELIVERY 末尾的其他限制（无鉴权、共边身份启发式匹配、无 R-tree 等）
+   仍然成立。
+
+---
+---
+
+# 第一轮交付说明（2026-11-25，原文保留）
+
 交付时间：2026-11-25。分支 `main`，基线提交 `3f7a0fe`，本次改动均为新增文件，
 尚未提交 git（按约定需要你确认后再 commit）。
 

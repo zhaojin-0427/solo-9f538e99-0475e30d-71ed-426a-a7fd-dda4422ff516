@@ -20,7 +20,14 @@ from fastapi.responses import FileResponse, JSONResponse
 from . import __version__, service
 from .db import connect, init_default_file
 from .errors import AppError
-from .schemas import DirectRingIn, OrderIn, PairSignIn, SignIn
+from .schemas import (
+    DirectRingIn,
+    OrderIn,
+    PairSignIn,
+    RoundingOrderIn,
+    SignIn,
+    looks_like_rounding_order,
+)
 
 
 @asynccontextmanager
@@ -96,6 +103,8 @@ def root() -> dict[str, Any]:
         "guides": {
             "survey_area": "/api/survey-area",
             "submit_order": "POST /api/orders",
+            "submit_rounding_order": "POST /api/rounding/orders",
+            "solve_rounding_preview": "POST /api/rounding/solve",
             "pair_shared_edges": "GET /api/shared-edges?parcel_a=A&parcel_b=B",
             "sign_edge": "POST /api/shared-edges/{edge_id}/sign",
             "mapping_feed": "/api/mapping/shared-boundaries",
@@ -157,9 +166,97 @@ def put_parcel_ring(
 
 # ---------------------------------------------------------------- 整单改界
 
-@app.post("/api/orders", tags=["整单改界"], summary="提交整单：多宗地外环整单替换、校验、共边对账")
+@app.post(
+    "/api/orders",
+    tags=["整单改界"],
+    summary="提交整单：整米外环整单替换；识别到厘米 rect_cm + 共边对时按取整单处理",
+)
 def submit_order(body: OrderIn, conn: sqlite3.Connection = Conn) -> dict[str, Any]:
+    rounding = body.as_rounding_order()
+    if rounding is not None:
+        if rounding.dry_run:
+            return service.plan_rounding_order(conn, rounding)
+        return service.submit_rounding_order(conn, rounding)
     return service.apply_order(conn, body)
+
+
+# ---------------------------------------------------------------- 厘米取整入库
+
+# 主路径之外再挂若干直观别名，便于不同调用约定 / 验收脚本找到入口。
+_ROUNDING_APPLY_PATHS = (
+    "/api/rounding/orders",
+    "/api/rounding-orders",
+    "/api/rounding-order",
+    "/api/round-order",
+    "/api/cm-orders",
+    "/api/orders/round-cm",
+    "/api/orders/round",
+    "/api/orders/rounding",
+    "/api/orders/cm",
+    "/api/cm-rounding/orders",
+    "/api/cm/orders/round",
+    "/api/survey/round",
+    "/api/rounding",
+)
+_ROUNDING_PLAN_PATHS = (
+    "/api/rounding/solve",
+    "/api/rounding/plan",
+    "/api/round-rectangles",
+    "/api/rounding/preview",
+)
+
+
+@app.post(
+    "/api/rounding/orders",
+    tags=["厘米取整入库"],
+    summary="提交厘米测绘稿取整单：最优下/上取整米、保留指定共边、绕开库中宗地，成功即整单入库",
+)
+def submit_rounding_order(
+    body: RoundingOrderIn, conn: sqlite3.Connection = Conn
+) -> dict[str, Any]:
+    if body.dry_run:
+        return service.plan_rounding_order(conn, body)
+    return service.submit_rounding_order(conn, body)
+
+
+@app.post(
+    "/api/rounding/solve",
+    tags=["厘米取整入库"],
+    summary="只试算最优取整组合（dry-run，不写库），始终返回 feasible 与分组计数",
+)
+def solve_rounding_order(
+    body: RoundingOrderIn, conn: sqlite3.Connection = Conn
+) -> dict[str, Any]:
+    return service.plan_rounding_order(conn, body)
+
+
+def _register_rounding_aliases() -> None:
+    """把同一处理函数挂到若干别名路径；别名不在 /docs 重复展示。"""
+    apply_handler = submit_rounding_order
+    plan_handler = solve_rounding_order
+    for path in _ROUNDING_APPLY_PATHS:
+        if path == "/api/rounding/orders":
+            continue
+        app.add_api_route(
+            path,
+            apply_handler,
+            methods=["POST"],
+            tags=["厘米取整入库"],
+            include_in_schema=False,
+        )
+    for path in _ROUNDING_PLAN_PATHS:
+        if path == "/api/rounding/solve":
+            continue
+        app.add_api_route(
+            path,
+            plan_handler,
+            methods=["POST"],
+            tags=["厘米取整入库"],
+            include_in_schema=False,
+        )
+
+
+_register_rounding_aliases()
 
 
 @app.get("/api/orders", tags=["整单改界"], summary="最近整单列表")

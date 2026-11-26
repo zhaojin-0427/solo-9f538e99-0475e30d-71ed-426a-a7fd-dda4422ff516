@@ -13,7 +13,14 @@ import sqlite3
 from typing import Any
 
 from .db import utcnow_iso
-from .errors import NotFoundError, OrderNoExistsError, ParcelConflictError, StaleSignoffError
+from .errors import (
+    InvalidRoundingRequestError,
+    NoFeasibleRoundingError,
+    NotFoundError,
+    OrderNoExistsError,
+    ParcelConflictError,
+    StaleSignoffError,
+)
 from .geometry import (
     BBox,
     Seg,
@@ -22,7 +29,8 @@ from .geometry import (
     plan_ring_reads,
     shared_segments,
 )
-from .schemas import OrderIn
+from .rounding import edge_choices, solve_rounding
+from .schemas import OrderIn, RoundingOrderIn
 
 # ------------------------------------------------------------ 序列化
 
@@ -279,146 +287,11 @@ def apply_order(conn: sqlite3.Connection, order: OrderIn) -> dict[str, Any]:
     now = utcnow_iso()
 
     # 先做不依赖库的环校验（错误直接 422，尚未开启事务）
-    normalized: dict[str, list[tuple[int, int]]] = {}
-    new_bboxes: dict[str, BBox] = {}
-    for item in order.parcels:
-        ring = normalize_ring_safe(item.ring, item.parcel_no)
-        normalized[item.parcel_no] = ring
-        new_bboxes[item.parcel_no] = bbox(ring)
-
-    order_nos = set(normalized)
+    normalized, new_bboxes = validate_order_geometry(order)
 
     conn.execute("BEGIN IMMEDIATE")
     try:
-        # 单号处理（写锁内取序号，避免并发重号）
-        seq_row = conn.execute("SELECT COALESCE(MAX(order_id), 0) + 1 AS seq FROM orders").fetchone()
-        seq = seq_row["seq"]
-        order_no = order.order_no or f"ORD-{seq:04d}"
-        if conn.execute("SELECT 1 FROM orders WHERE order_no = ?", (order_no,)).fetchone():
-            raise OrderNoExistsError(f"单号 {order_no} 已存在", order_no=order_no)
-
-        # 全量外接框扫描（不读外环），取本单各宗地的旧外接框
-        bbox_rows = conn.execute(
-            "SELECT parcel_no, minx, miny, maxx, maxy FROM parcels"
-        ).fetchall()
-        all_bboxes: list[tuple[str, BBox]] = []
-        old_bboxes: dict[str, BBox] = {}
-        for r in bbox_rows:
-            box: BBox = (r["minx"], r["miny"], r["maxx"], r["maxy"])
-            all_bboxes.append((r["parcel_no"], box))
-            if r["parcel_no"] in order_nos:
-                old_bboxes[r["parcel_no"]] = box
-
-        query_boxes: list[BBox] = list(new_bboxes.values()) + list(old_bboxes.values())
-        selected = plan_ring_reads(all_bboxes, order_nos, query_boxes)
-
-        # 只回读候选宗地的外环 JSON
-        existing_nos = [n for n in selected if n not in normalized]
-        db_rings: dict[str, list[tuple[int, int]]] = {}
-        rings_read_from_db: list[str] = []
-        if existing_nos:
-            marks = ",".join("?" for _ in existing_nos)
-            ring_rows = conn.execute(
-                f"SELECT parcel_no, ring_json FROM parcels WHERE parcel_no IN ({marks})",
-                existing_nos,
-            ).fetchall()
-            for r in ring_rows:
-                db_rings[r["parcel_no"]] = [tuple(p) for p in json.loads(r["ring_json"])]  # type: ignore[arg-type]
-                rings_read_from_db.append(r["parcel_no"])
-
-        post_rings: dict[str, list[tuple[int, int]]] = {}
-        for no in selected:
-            if no in normalized:
-                post_rings[no] = normalized[no]
-            elif no in db_rings:
-                post_rings[no] = db_rings[no]
-
-        # 以“整单替换后的图形”为准做冲突校验；只查至少一侧在本单内的对
-        conflicts: list[dict[str, Any]] = []
-        affected_pairs: set[tuple[str, str]] = set()
-        checked: set[tuple[str, str]] = set()
-        for no in sorted(order_nos):
-            for other in sorted(selected):
-                if other == no:
-                    continue
-                pair = (no, other) if no < other else (other, no)
-                if pair in checked:
-                    continue
-                checked.add(pair)
-                affected_pairs.add(pair)
-                if has_interior_overlap(post_rings[no], post_rings[other]):
-                    conflicts.append(
-                        {
-                            "conflict_id": f"C{len(conflicts) + 1}",
-                            "parcels": list(pair),
-                            "reason": "interior_overlap",
-                            "message": "两宗地内部相交（正面积重叠）",
-                        }
-                    )
-
-        if conflicts:
-            raise ParcelConflictError(conflicts)
-
-        # 落单头
-        cur = conn.execute(
-            "INSERT INTO orders (order_no, item_count, result_json, created_at) VALUES (?, ?, ?, ?)",
-            (order_no, len(order.parcels), "{}", now),
-        )
-        order_id = cur.lastrowid
-
-        # upsert 宗地外环
-        for no, ring in normalized.items():
-            minx, miny, maxx, maxy = new_bboxes[no]
-            from .geometry import signed_area2
-
-            conn.execute(
-                """INSERT INTO parcels
-                   (parcel_no, ring_json, minx, miny, maxx, maxy, area2, order_id, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(parcel_no) DO UPDATE SET
-                     ring_json=excluded.ring_json, minx=excluded.minx, miny=excluded.miny,
-                     maxx=excluded.maxx, maxy=excluded.maxy, area2=excluded.area2,
-                     order_id=excluded.order_id, updated_at=excluded.updated_at""",
-                (
-                    no,
-                    json.dumps([list(p) for p in ring], ensure_ascii=False),
-                    minx,
-                    miny,
-                    maxx,
-                    maxy,
-                    abs(signed_area2(ring)),
-                    order_id,
-                    now,
-                ),
-            )
-
-        # 重算受影响宗地对的共边并对账版本 / 签收
-        edge_summary = {"unchanged": [], "updated": [], "created": [], "removed": []}
-        for pa, pb in sorted(affected_pairs):
-            segs = shared_segments(post_rings[pa], post_rings[pb])
-            part = reconcile_pair(conn, pa, pb, segs, order_id, now)
-            for k in edge_summary:
-                edge_summary[k].extend(part[k])
-
-        summary: dict[str, Any] = {
-            "order_no": order_no,
-            "order_id": order_id,
-            "status": "applied",
-            "applied_parcels": sorted(order_nos),
-            "readback": {
-                "candidate_parcels": sorted(selected),
-                "candidate_count": len(selected),
-                "rings_read_from_db": sorted(rings_read_from_db),
-                "ring_read_count": len(rings_read_from_db),
-                "note": "仅回读外接框与本单任一新/旧外接框相交的宗地外环",
-            },
-            "shared_edges": edge_summary,
-            "created_at": now,
-        }
-        conn.execute(
-            "UPDATE orders SET result_json = ? WHERE order_id = ?",
-            (json.dumps(summary, ensure_ascii=False), order_id),
-        )
+        summary = persist_validated_order(conn, order, normalized, new_bboxes, now)
         conn.commit()
         return summary
     except BaseException:
@@ -426,11 +299,404 @@ def apply_order(conn: sqlite3.Connection, order: OrderIn) -> dict[str, Any]:
         raise
 
 
+def validate_order_geometry(
+    order: OrderIn,
+) -> tuple[dict[str, list[tuple[int, int]]], dict[str, BBox]]:
+    normalized: dict[str, list[tuple[int, int]]] = {}
+    new_bboxes: dict[str, BBox] = {}
+    for item in order.parcels:
+        ring = normalize_ring_safe(item.ring, item.parcel_no)
+        normalized[item.parcel_no] = ring
+        new_bboxes[item.parcel_no] = bbox(ring)
+    return normalized, new_bboxes
+
+
+def persist_validated_order(
+    conn: sqlite3.Connection,
+    order: OrderIn,
+    normalized: dict[str, list[tuple[int, int]]],
+    new_bboxes: dict[str, BBox],
+    now: str,
+) -> dict[str, Any]:
+    """在 **已开启的事务** 内完成整单落库，不负责 commit / rollback。
+
+    厘米取整单在同一个 ``BEGIN IMMEDIATE`` 事务内“按入库时现行图求解 +
+    走完整整单改界规则”，因此也复用本函数。
+    """
+    order_nos = set(normalized)
+
+    # 单号处理（写锁内取序号，避免并发重号）
+    seq_row = conn.execute("SELECT COALESCE(MAX(order_id), 0) + 1 AS seq FROM orders").fetchone()
+    seq = seq_row["seq"]
+    order_no = order.order_no or f"ORD-{seq:04d}"
+    if conn.execute("SELECT 1 FROM orders WHERE order_no = ?", (order_no,)).fetchone():
+        raise OrderNoExistsError(f"单号 {order_no} 已存在", order_no=order_no)
+
+    # 全量外接框扫描（不读外环），取本单各宗地的旧外接框
+    bbox_rows = conn.execute(
+        "SELECT parcel_no, minx, miny, maxx, maxy FROM parcels"
+    ).fetchall()
+    all_bboxes: list[tuple[str, BBox]] = []
+    old_bboxes: dict[str, BBox] = {}
+    for r in bbox_rows:
+        box: BBox = (r["minx"], r["miny"], r["maxx"], r["maxy"])
+        all_bboxes.append((r["parcel_no"], box))
+        if r["parcel_no"] in order_nos:
+            old_bboxes[r["parcel_no"]] = box
+
+    query_boxes: list[BBox] = list(new_bboxes.values()) + list(old_bboxes.values())
+    selected = plan_ring_reads(all_bboxes, order_nos, query_boxes)
+
+    # 只回读候选宗地的外环 JSON
+    existing_nos = [n for n in selected if n not in normalized]
+    db_rings: dict[str, list[tuple[int, int]]] = {}
+    rings_read_from_db: list[str] = []
+    if existing_nos:
+        marks = ",".join("?" for _ in existing_nos)
+        ring_rows = conn.execute(
+            f"SELECT parcel_no, ring_json FROM parcels WHERE parcel_no IN ({marks})",
+            existing_nos,
+        ).fetchall()
+        for r in ring_rows:
+            db_rings[r["parcel_no"]] = [tuple(p) for p in json.loads(r["ring_json"])]  # type: ignore[arg-type]
+            rings_read_from_db.append(r["parcel_no"])
+
+    post_rings: dict[str, list[tuple[int, int]]] = {}
+    for no in selected:
+        if no in normalized:
+            post_rings[no] = normalized[no]
+        elif no in db_rings:
+            post_rings[no] = db_rings[no]
+
+    # 以“整单替换后的图形”为准做冲突校验；只查至少一侧在本单内的对
+    conflicts: list[dict[str, Any]] = []
+    affected_pairs: set[tuple[str, str]] = set()
+    checked: set[tuple[str, str]] = set()
+    for no in sorted(order_nos):
+        for other in sorted(selected):
+            if other == no:
+                continue
+            pair = (no, other) if no < other else (other, no)
+            if pair in checked:
+                continue
+            checked.add(pair)
+            affected_pairs.add(pair)
+            if has_interior_overlap(post_rings[no], post_rings[other]):
+                conflicts.append(
+                    {
+                        "conflict_id": f"C{len(conflicts) + 1}",
+                        "parcels": list(pair),
+                        "reason": "interior_overlap",
+                        "message": "两宗地内部相交（正面积重叠）",
+                    }
+                )
+
+    if conflicts:
+        raise ParcelConflictError(conflicts)
+
+    # 落单头
+    cur = conn.execute(
+        "INSERT INTO orders (order_no, item_count, result_json, created_at) VALUES (?, ?, ?, ?)",
+        (order_no, len(order.parcels), "{}", now),
+    )
+    order_id = cur.lastrowid
+
+    # upsert 宗地外环
+    for no, ring in normalized.items():
+        minx, miny, maxx, maxy = new_bboxes[no]
+        from .geometry import signed_area2
+
+        conn.execute(
+            """INSERT INTO parcels
+               (parcel_no, ring_json, minx, miny, maxx, maxy, area2, order_id, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(parcel_no) DO UPDATE SET
+                 ring_json=excluded.ring_json, minx=excluded.minx, miny=excluded.miny,
+                 maxx=excluded.maxx, maxy=excluded.maxy, area2=excluded.area2,
+                 order_id=excluded.order_id, updated_at=excluded.updated_at""",
+            (
+                no,
+                json.dumps([list(p) for p in ring], ensure_ascii=False),
+                minx,
+                miny,
+                maxx,
+                maxy,
+                abs(signed_area2(ring)),
+                order_id,
+                now,
+            ),
+        )
+
+    # 重算受影响宗地对的共边并对账版本 / 签收
+    edge_summary = {"unchanged": [], "updated": [], "created": [], "removed": []}
+    for pa, pb in sorted(affected_pairs):
+        segs = shared_segments(post_rings[pa], post_rings[pb])
+        part = reconcile_pair(conn, pa, pb, segs, order_id, now)
+        for k in edge_summary:
+            edge_summary[k].extend(part[k])
+
+    summary: dict[str, Any] = {
+        "order_no": order_no,
+        "order_id": order_id,
+        "status": "applied",
+        "applied_parcels": sorted(order_nos),
+        "readback": {
+            "candidate_parcels": sorted(selected),
+            "candidate_count": len(selected),
+            "rings_read_from_db": sorted(rings_read_from_db),
+            "ring_read_count": len(rings_read_from_db),
+            "note": "仅回读外接框与本单任一新/旧外接框相交的宗地外环",
+        },
+        "shared_edges": edge_summary,
+        "created_at": now,
+    }
+    conn.execute(
+        "UPDATE orders SET result_json = ? WHERE order_id = ?",
+        (json.dumps(summary, ensure_ascii=False), order_id),
+    )
+    # 注意：不在此处 commit，事务边界由 apply_order / 取整服务控制
+    return summary
+
+
 def normalize_ring_safe(raw: Any, parcel_no: str) -> list[tuple[int, int]]:
     # 间接一层便于测试 monkeypatch 注入故障
     from .geometry import normalize_ring
 
     return normalize_ring(raw, parcel_no)
+
+
+# ------------------------------------------------------------ 厘米取整单
+
+
+def _candidate_envelope_m(cm_rect: tuple[int, int, int, int]) -> BBox:
+    """一条边只能取 floor/ceil，候选外接框的并集包络（整米，宁大勿小）。"""
+    l, b, r, t = cm_rect
+    l_opts = [e.metres for e in edge_choices(l)]
+    b_opts = [e.metres for e in edge_choices(b)]
+    r_opts = [e.metres for e in edge_choices(r)]
+    t_opts = [e.metres for e in edge_choices(t)]
+    return min(l_opts), min(b_opts), max(r_opts), max(t_opts)
+
+
+def load_fixed_geometry_for_rounding(
+    conn: sqlite3.Connection,
+    solver_parcels: dict[str, tuple[int, int, int, int]],
+    pairs: list[tuple[str, str]],
+) -> tuple[dict[str, list[tuple[int, int]]], dict[str, Any]]:
+    """读取求解需要的“库中未改单宗地”整米外环。
+
+    先用外接框四列做候选筛选（与整单改界同一套回读规划），只回读候选外环；
+    共边保留对引用的库内宗地无论位置都强制回读。
+    """
+    order_nos = set(solver_parcels)
+    envelopes = {no: _candidate_envelope_m(rect) for no, rect in solver_parcels.items()}
+
+    rows = conn.execute(
+        "SELECT parcel_no, minx, miny, maxx, maxy FROM parcels"
+    ).fetchall()
+    all_bboxes: list[tuple[str, BBox]] = []
+    for r in rows:
+        if r["parcel_no"] in order_nos:
+            continue  # 本单宗地将被整单替换，旧图形不是障碍
+        all_bboxes.append(
+            (r["parcel_no"], (r["minx"], r["miny"], r["maxx"], r["maxy"]))
+        )
+
+    selected = plan_ring_reads(
+        all_bboxes, order_parcel_nos=set(), query_boxes=list(envelopes.values())
+    )
+    # plan_ring_reads 会并入 order_parcel_nos（这里传空集）；显式再保一次底
+    selected = {no for no in selected if no not in order_nos}
+
+    pair_db_nos = {
+        x
+        for pair in pairs
+        for x in pair
+        if x not in order_nos
+    }
+    selected |= pair_db_nos
+
+    fixed: dict[str, list[tuple[int, int]]] = {}
+    read_nos = sorted(selected)
+    if read_nos:
+        marks = ",".join("?" for _ in read_nos)
+        ring_rows = conn.execute(
+            f"SELECT parcel_no, ring_json FROM parcels WHERE parcel_no IN ({marks})",
+            read_nos,
+        ).fetchall()
+        found: set[str] = set()
+        for r in ring_rows:
+            fixed[r["parcel_no"]] = [tuple(p) for p in json.loads(r["ring_json"])]  # type: ignore[arg-type]
+            found.add(r["parcel_no"])
+        missing = sorted(pair_db_nos - found)
+        if missing:
+            raise NotFoundError(
+                f"共边保留对引用的库内宗地不存在: {missing}",
+                unknown_parcels=missing,
+            )
+
+    plan_info = {
+        "db_parcel_count": len(all_bboxes),
+        "rings_read_from_db": read_nos,
+        "ring_read_count": len(read_nos),
+        "envelopes_metres": {no: list(box) for no, box in sorted(envelopes.items())},
+    }
+    return fixed, plan_info
+
+
+def _solve_body_against_conn(
+    conn: sqlite3.Connection, body: RoundingOrderIn
+) -> tuple[dict[str, Any], dict[str, list[tuple[int, int]]], dict[str, Any]]:
+    solver_parcels = body.solver_parcels()
+    pairs = body.solver_pairs()
+    fixed, read_info = load_fixed_geometry_for_rounding(conn, solver_parcels, pairs)
+    solution = solve_rounding(
+        solver_parcels,
+        preserve_pairs=pairs,
+        fixed_geometry=fixed,
+    )
+    return solution, fixed, read_info
+
+
+def plan_rounding_order(conn: sqlite3.Connection, body: RoundingOrderIn) -> dict[str, Any]:
+    """只试算不落库（dry-run）。读取现行宗地图，但不开启写事务。"""
+    solution, _fixed, read_info = _solve_body_against_conn(conn, body)
+    assignments = solution.get("assignments", [])
+    return {
+        "status": "planned",
+        "dry_run": True,
+        "applied": False,
+        "unit_in": "cm",
+        "unit_out": "m",
+        "rectangles": assignments,
+        "rounded_rectangles": assignments,
+        "results": assignments,
+        "db_readback": read_info,
+        **solution,
+    }
+
+
+def submit_rounding_order(
+    conn: sqlite3.Connection, body: RoundingOrderIn
+) -> dict[str, Any]:
+    """一个 ``BEGIN IMMEDIATE`` 事务内：读现行图 → 最优取整 → 整单改界落库。
+
+    无解：回滚（事实上未写入）并抛 :class:`NoFeasibleRoundingError`；
+    写入失败：同一事务回滚，原宗地图 / 共边 / 供数照旧。
+    """
+    now = utcnow_iso()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        solution, _fixed, read_info = _solve_body_against_conn(conn, body)
+
+        if solution.get("unknown_parcels"):
+            raise InvalidRoundingRequestError(
+                "共边保留对引用了既不在本单、也不在库中的宗地",
+                unknown_parcels=solution["unknown_parcels"],
+            )
+        if not solution.get("feasible"):
+            raise NoFeasibleRoundingError(
+                "无可行的整米取整组合：无法同时满足正面积、保留正长度共边以及"
+                "不与本单 / 库中宗地正面积叠压；原宗地图与供数未改变",
+                solver=solution,
+                reasons=solution.get("reasons", []),
+                combinations_checked=solution.get("combinations_checked", 0),
+                group_count=solution.get("group_count", 0),
+            )
+
+        # 用求出的整米矩形构造标准整单，复用整单改界的全部规则
+        meter_parcels = [
+            {"parcel_no": item["parcel_no"], "ring": item["ring"]}
+            for item in solution["assignments"]
+        ]
+        order_in = OrderIn.model_validate(
+            {
+                "order_no": body.order_no,
+                "parcels": meter_parcels,
+            }
+        )
+        normalized, new_bboxes = validate_order_geometry(order_in)
+        summary = persist_validated_order(
+            conn, order_in, normalized, new_bboxes, now
+        )
+
+        rounding_report = {
+            "unit_in": "cm",
+            "unit_out": "m",
+            "total_cost_cm": solution["total_cost_cm"],
+            "total_displacement_cm": solution["total_displacement_cm"],
+            "total_displacement_m": solution["total_displacement_m"],
+            "lex_key": solution["lex_key"],
+            "combinations_checked": solution["combinations_checked"],
+            "naive_joint_combinations": solution["naive_joint_combinations"],
+            "group_count": solution["group_count"],
+            "groups": solution["groups"],
+            "preserve_pairs": solution["preserve_pairs"],
+            "db_readback": read_info,
+        }
+        summary["rounding"] = rounding_report
+        # 让整单记录里也带上取整报告
+        conn.execute(
+            "UPDATE orders SET result_json = ? WHERE order_id = ?",
+            (json.dumps(summary, ensure_ascii=False), summary["order_id"]),
+        )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+
+    rectangles = solution["assignments"]
+    return {
+        "status": "applied",
+        "applied": True,
+        "dry_run": False,
+        "unit_in": "cm",
+        "unit_out": "m",
+        "order_no": summary["order_no"],
+        "order_id": summary["order_id"],
+        "parcel_count": len(rectangles),
+        # 多种直观字段名，方便不同调用方
+        "rectangles": rectangles,
+        "rounded_rectangles": rectangles,
+        "best_rectangles": rectangles,
+        "results": rectangles,
+        "rounded_parcels": rectangles,
+        "solution": solution,
+        "parcels": [
+            {
+                "parcel_no": item["parcel_no"],
+                "rect": item["rect"],
+                "ring": item["ring"],
+                "bbox": item["bbox"],
+                "cost_cm": item["cost_cm"],
+            }
+            for item in rectangles
+        ],
+        "preserve_pairs": solution["preserve_pairs"],
+        "cost": solution["total_cost_cm"],
+        "objective_value_cm": solution["total_cost_cm"],
+        "total_cost_cm": solution["total_cost_cm"],
+        "total_displacement_cm": solution["total_displacement_cm"],
+        "total_displacement_m": solution["total_displacement_m"],
+        "lex_key": solution["lex_key"],
+        "combinations_checked": solution["combinations_checked"],
+        "naive_joint_combinations": solution["naive_joint_combinations"],
+        "group_count": solution["group_count"],
+        "groups": solution["groups"],
+        "solver_stats": {
+            "combinations_checked": solution["combinations_checked"],
+            "naive_joint_combinations": solution["naive_joint_combinations"],
+            "group_count": solution["group_count"],
+            "groups": solution["groups"],
+        },
+        "db_readback": read_info,
+        # 直接展开整单改界结果，老调用方关心的 shared_edges / readback 仍在顶层
+        "shared_edges": summary["shared_edges"],
+        "readback": summary["readback"],
+        "applied_parcels": summary["applied_parcels"],
+        "order_result": summary,
+        "created_at": summary["created_at"],
+    }
 
 
 # ------------------------------------------------------------ 查询

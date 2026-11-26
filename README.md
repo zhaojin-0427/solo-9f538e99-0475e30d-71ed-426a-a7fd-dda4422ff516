@@ -47,7 +47,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```bash
 pip install -r requirements-dev.txt
 pytest -q
-python scripts/trial.py           # 端到端叙述式试跑，自带 25 条断言
+python scripts/trial.py           # 共边核验主链路叙述式试跑，25 条断言
+python scripts/trial_rounding.py  # 厘米取整：保共边 / 绕障 / 分组线性 / 无解照旧
 ```
 
 数据库路径可用环境变量 `CADASTRE_DB_PATH` 覆盖（默认仓库下 `data/cadastre.db`），
@@ -151,6 +152,54 @@ curl http://localhost:8000/api/mapping/delivery/1     # 过期/消失 -> 409
 
 ---
 
+## 3.6 厘米测绘稿 → 整米最优取整单
+
+测绘稿坐标以**厘米**记，地籍库按**整米**入库。在 `/docs` 调
+`POST /api/rounding/orders`（别名 `/api/orders/round-cm`、`/api/rounding`，
+也可直接向 `POST /api/orders` 传 `"unit":"cm"` 的同类报文）提交：
+
+- 一单的宗地号；
+- 每宗地的整数厘米轴对齐矩形 `rect_cm = [左, 下, 右, 上]`（也收 `rect/bbox`、
+  4 个角点 `ring`、宗地号→矩形映射等宽松写法）；
+- `preserve_pairs`：取整后仍须保留**正长度共边**的宗地对。
+
+```bash
+curl -X POST http://localhost:8000/api/rounding/orders \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "order_no": "CM-0001",
+    "parcels": [
+      {"parcel_no": "A", "rect_cm": [0, 0, 1005, 1000]},
+      {"parcel_no": "B", "rect_cm": [1099, 0, 2000, 1000]}
+    ],
+    "preserve_pairs": [["A", "B"]]
+  }'
+```
+
+求解规则（`app/rounding.py`，纯整数运算、不铺格）：
+
+1. 每条边只能取 `floor(cm/100)`（向下）或 `ceil(cm/100)`（向上），恰为整米时唯一；
+2. 过滤掉非正面积、越界矩形，以及与库中未改单宗地正面积叠压的候选；
+3. 指定宗地对必须仍有严格正长度共边（单点接触不算）；
+4. 本单宗地之间也不得正面积叠压；
+5. 目标 = 各边位移绝对值之和（厘米整数，米制只差 100 倍常数因子）最小；
+6. 平局：宗地号升序，逐宗按 `左、下、右、上` 拼字典序键取最小。
+
+**分组不指数爆炸**：以“有共边要求 / 存在候选对可能叠压”建耦合图取连通分量，
+只逐分量笛卡尔枚举，`combinations_checked = Σ_分量 ∏候选数`。候选范围互不相交、
+组间无共边要求的 n 个组（单宗）时 `≤16n`，线性增长；响应的 `groups`、
+`combinations_checked`、`naive_joint_combinations` 可核对这一点。
+
+**事务与照旧**：在一个 `BEGIN IMMEDIATE` 内按入库时的现行宗地图求解，成功后把
+整米矩形构造成标准整单，复用第 3.1–3.4 节的整单改界、共边版本对账与签收规则。
+无解返回 `409 no_feasible_rounding`（带 `solver` 统计与原因），不写单、不写宗地；
+写盘故障同一事务回滚——原宗地图、共边签收与制图供数照旧。`POST /api/rounding/solve`
+为只试算不写库的 dry-run（始终 200，含 `feasible`）。
+
+存储沿用原 SQLite 库与 compose 命名卷 `cadastre-data`，**未改表结构**，旧卷直接可用。
+
+---
+
 ## 4. API 一览
 
 | 方法 & 路径 | 说明 |
@@ -158,7 +207,9 @@ curl http://localhost:8000/api/mapping/delivery/1     # 过期/消失 -> 409
 | `GET /docs` | Swagger UI（自托管资源） |
 | `GET /health` | 健康检查（含 SQLite `SELECT 1`） |
 | `GET /api/survey-area` | 唯一测区、坐标范围、宗地 / 共边计数 |
-| `POST /api/orders` | 提交整单（核心入口） |
+| `POST /api/orders` | 提交整单（核心入口；识别到 `unit:"cm"`/`rect_cm`+共边对时按厘米取整单处理） |
+| `POST /api/rounding/orders` | 厘米稿最优下/上取整、保共边、绕开库中宗地，成功即整单入库 |
+| `POST /api/rounding/solve` | 取整方案 dry-run，不写库，返回 `feasible`/分组/组合检查数 |
 | `GET /api/orders` / `GET /api/orders/{order_no}` | 整单列表 / 处理结果（含回读与对账明细） |
 | `GET /api/parcels` / `GET /api/parcels/{no}` | 宗地列表（仅外接框）/ 读外环 |
 | `PUT /api/parcels/{no}/ring` | 单宗地录入 / 更正（按一宗地的整单生效） |
